@@ -1,5 +1,5 @@
 
-from keras.layers import Input, Embedding, LSTM,  Dense, concatenate, Concatenate, Dot, Bidirectional, RepeatVector
+from keras.layers import Input, Embedding, LSTM,  Dense, Concatenate, Dot, Bidirectional, Lambda
 from keras.preprocessing.sequence import pad_sequences
 from keras.preprocessing.text import Tokenizer
 from keras.models import Model
@@ -9,9 +9,9 @@ import os
 
 # some config
 BATCH_SIZE = 64  # Batch size for training.
-EPOCHS = 50  # Number of epochs to train for.
+EPOCHS = 100  # Number of epochs to train for.
 LATENT_DIM = 256  # Latent dimensionality of the encoding space.
-NUM_SAMPLES = 1000  # Number of samples to train on.
+NUM_SAMPLES = 30  # Number of samples to train on.
 MAX_SEQUENCE_LENGTH = 100
 MAX_NUM_WORDS = 20000
 EMBEDDING_DIM = 100
@@ -31,7 +31,7 @@ with open('../data/faq-test.question', encoding="utf8") as f:
     input_questions = [current_place.rstrip() for current_place in f.readlines()]
 
 ## Load target answers
-with open('../data/faq-test.context', encoding="utf8") as f:
+with open('../data/faq-test.answer', encoding="utf8") as f:
     answers = [current_place.rstrip() for current_place in f.readlines()]
     for texts in answers:
         # make the target input and output
@@ -102,12 +102,11 @@ print("decoder_inputs.shape:", decoder_inputs.shape)
 ## calculate the vocab size
 num_words = min(MAX_NUM_WORDS, len(word2idx_inputs) + 1)
 
-def get_embed_matrix(glove_dim):
+def get_embed_matrix():
 
     # store all the pre-trained word vectors
     print('Loading word vectors...')
     word2vec = {}
-    #with open(os.path.join('C:/Users/Test/PycharmProjects/Udemy/NLP/cs224n-squad-master/data/glove.6B.%sd.txt' % EMBEDDING_DIM),encoding="utf8") as f:
     with open(os.path.join('../data/glove.6B.%sd.txt' % EMBEDDING_DIM),encoding="utf8") as f:
       # is just a space-separated text file in the format:
       # word vec[0] vec[1] vec[2] ...
@@ -129,7 +128,7 @@ def get_embed_matrix(glove_dim):
           # words not found in embedding index will be all zeros.
           embedding_matrix[i] = embedding_vector
     return embedding_matrix
-embedding_matrix = get_embed_matrix(100)
+embedding_matrix = get_embed_matrix()
 
 # create context embedding layer
 context_embedding_layer = Embedding(
@@ -155,7 +154,7 @@ question_embedding_layer = Embedding(
 decoder_targets_one_hot = np.zeros(
   (
     len(input_context),
-    max_len_context_input_sequences,
+    max_len_target,
     num_words_output
   ),
   dtype='float32'
@@ -170,7 +169,7 @@ def softmax_over_time(x):
 encoder = Bidirectional(LSTM(
     LATENT_DIM,
   return_sequences=True,
-  dropout=0.5 # dropout not available on gpu
+  dropout=0.15 # dropout not available on gpu
 ))
 
 ##### build the model #####
@@ -191,39 +190,25 @@ questions_encoder_outputs = encoder(x2)
 print("questions_encoder_outputs: ", questions_encoder_outputs.shape)
 print("context_encoder_outputs: ", context_encoder_outputs.shape)
 
+decoder_inputs_placeholder = Input(shape=(max_len_target,))
 decoder_embedding = Embedding(num_words_output, EMBEDDING_DIM)
+decoder_inputs_x = decoder_embedding(decoder_inputs_placeholder)
 
 ######### Attention #########
 # Attention layers need to be global because
 # they will be repeated Ty times at the decoder
 attn_concat_layer = Concatenate(axis=-1)
 attn_dense1 = Dense(10, activation='tanh')
-attn_dense2 = Dense(512, activation='softmax')
+attn_dense2 = Dense(1, activation='softmax')
 attn_dot = Dot(axes=-1) # to perform the weighted sum of alpha[t] * h[t]
+attn_dot2 = Dot(axes=1)
 
 def one_step_attention(hidden_context, hidden_question):
     context = attn_dot([hidden_context,hidden_question])
+    context = attn_dense1(context)
     x = attn_dense2(context)
-    context2 = attn_dot([x,hidden_question])
+    context2 = attn_dot2([x,hidden_context])
     return context2
-
-context = one_step_attention(context_encoder_outputs, questions_encoder_outputs)
-#context2 = concatenate([context,context_encoder_outputs])
-outputs = Dense(num_words_output,activation="softmax")(context)
-
-print("output shape: ", outputs.shape)
-
-# Create the model object
-model = Model([context_encoder_inputs_placeholder, questions_encoder_inputs_placeholder], outputs)
-model.compile(optimizer='adam', loss='categorical_crossentropy')
-
-r = model.fit(
-  [context_encoder_inputs, questions_encoder_inputs], decoder_targets_one_hot,
-  batch_size=BATCH_SIZE,
-  epochs=EPOCHS,
-  validation_split=0.2
-)
-
 
 decoder_lstm = LSTM(LATENT_DIM, return_state=True)
 decoder_dense = Dense(num_words_output, activation='softmax')
@@ -235,6 +220,71 @@ initial_c = Input(shape=(LATENT_DIM,), name='c0')
 # s, c will be re-assigned in each iteration of the loop
 s = initial_s
 c = initial_c
+
+# collect outputs in a list at first
+outputs = []
+for t in range(max_len_target): # Ty times
+  # get the context using attention
+  context = one_step_attention(context_encoder_outputs, questions_encoder_outputs)
+
+  # we need a different layer for each time step
+  selector = Lambda(lambda x: x[:, t:t+1])
+  xt = selector(decoder_inputs_x)
+
+  # combine
+  decoder_lstm_input = context_last_word_concat_layer([context, xt])
+
+  # pass the combined [context, last word] into the LSTM
+  # along with [s, c]
+  # get the new [s, c] and output
+  o, s, c = decoder_lstm(decoder_lstm_input, initial_state=[s, c])
+
+  # final dense layer to get next word prediction
+  decoder_outputs = decoder_dense(o)
+  outputs.append(decoder_outputs)
+
+# 'outputs' is now a list of length Ty
+# each element is of shape (batch size, output vocab size)
+# therefore if we simply stack all the outputs into 1 tensor
+# it would be of shape T x N x D
+# we would like it to be of shape N x T x D
+
+def stack_and_transpose(x):
+  # x is a list of length T, each element is a batch_size x output_vocab_size tensor
+  x = K.stack(x) # is now T x batch_size x output_vocab_size tensor
+  x = K.permute_dimensions(x, pattern=(1, 0, 2)) # is now batch_size x T x output_vocab_size
+  return x
+
+# make it a layer
+stacker = Lambda(stack_and_transpose)
+outputs = stacker(outputs)
+
+# create the model
+model = Model(
+  inputs=[
+    context_encoder_inputs_placeholder,
+    questions_encoder_inputs_placeholder,
+    decoder_inputs_placeholder,
+    initial_s,
+    initial_c,
+  ],
+  outputs=outputs
+)
+
+# compile the model
+model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+
+# train the model
+z = np.zeros((NUM_SAMPLES, LATENT_DIM)) # initial [s, c]
+# train the model
+z = np.zeros((NUM_SAMPLES, LATENT_DIM)) # initial [s, c]
+r = model.fit(
+  [context_encoder_inputs, questions_encoder_inputs,decoder_inputs, z, z], decoder_targets_one_hot,
+  batch_size=BATCH_SIZE,
+  epochs=EPOCHS,
+  validation_split=0.2
+)
+
 
 ##### Make predictions #####
 
@@ -252,10 +302,12 @@ decoder_inputs_single_x = decoder_embedding(decoder_inputs_single)
 dense_inputs_single = Input(shape=(1,))
 
 context = one_step_attention(context_encoder_outputs_as_input, questions_encoder_outputs_as_input)
+print("last context: ", context.shape)
+print("decoder_inputs_single_x: ", decoder_inputs_single_x.shape)
 # try combine context with last word
-#decoder_lstm_input = context_last_word_concat_layer([context,decoder_inputs_single_x])
+decoder_lstm_input = context_last_word_concat_layer([context,decoder_inputs_single_x])
 
-decoder_lstm_input = context_last_word_concat_layer([context, context_encoder_outputs_as_input])
+#decoder_lstm_input = context_last_word_concat_layer([context, context_encoder_outputs_as_input])
 
 # lstm and final dense
 o, s, c = decoder_lstm(decoder_lstm_input, initial_state=[initial_s, initial_c])
@@ -302,13 +354,14 @@ def decode_sequence(context_input_seq,questions_input_seq):
   output_sentence = []
   for _ in range(max_len_target):
     o, s, c = decoder_model.predict([target_seq,context_enc_input_as_out,question_enc_input_as_out,s,c])
+    print(o.shape)
     # Get next word
     idx = np.argmax(o.flatten())
 
     # End sentence of EOS
     if eos == idx:
       break
-    print("")
+    print("all idxs")
     #for idx in idx2word_trans:
         #print(idx, " ")
     word = ''
