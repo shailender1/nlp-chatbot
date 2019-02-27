@@ -9,7 +9,7 @@ import numpy as np
 EMBEDDING_DIM = 100
 NUM_SAMPLES = 30
 
-glove_file = datapath('C:/Users/Test/PycharmProjects/Udemy/NLP/cs224n-squad-master/data/glove.6B.100d.txt')
+glove_file = datapath('../data/glove.6B.100d.txt')
 tmp_file = get_tmpfile("test_word2vec.txt")
 _ = glove2word2vec(glove_file, tmp_file)
 model = KeyedVectors.load_word2vec_format(tmp_file)
